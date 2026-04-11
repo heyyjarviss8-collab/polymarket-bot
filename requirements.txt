@@ -1,4 +1,2 @@
 python-telegram-bot==20.7
 requests==2.31.0
-py-clob-client==0.34.6
-httpx==0.25.2
