@@ -2,21 +2,12 @@ import os
 import time
 import requests
 from datetime import datetime, timezone
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, MarketOrderArgs
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
-# ENV
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN").strip()
 CHAT_ID = str(os.environ.get("CHAT_ID")).strip()
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY").strip()
-POLY_API_KEY = os.environ.get("POLY_API_KEY").strip()
-
-# Polymarket CLOB client
-client = ClobClient(
-    host="https://clob.polymarket.com",
-    key=PRIVATE_KEY,
-    chain_id=137
-)
 
 watched_markets = {}
 
@@ -50,27 +41,64 @@ def get_price(token_id):
     except:
         return None
 
-def buy_token(token_id, amount_usd):
+def get_auth_headers():
+    account = Account.from_key(PRIVATE_KEY)
+    timestamp = str(int(time.time()))
+    message = encode_defunct(text=timestamp)
+    signed = account.sign_message(message)
+    return {
+        "POLY_ADDRESS": account.address,
+        "POLY_SIGNATURE": signed.signature.hex(),
+        "POLY_TIMESTAMP": timestamp,
+        "POLY_NONCE": timestamp,
+        "Content-Type": "application/json"
+    }
+
+def buy_token(token_id, price, amount_usd):
     try:
-        order = client.create_market_order(MarketOrderArgs(
-            token_id=token_id,
-            amount=amount_usd,
-        ))
-        resp = client.post_order(order)
-        return resp
+        size = round(amount_usd / price, 4)
+        headers = get_auth_headers()
+        order = {
+            "tokenID": token_id,
+            "price": price,
+            "size": size,
+            "side": "BUY",
+            "orderType": "GTC",
+            "feeRateBps": "0",
+            "nonce": "0",
+            "expiration": "0"
+        }
+        r = requests.post(
+            "https://clob.polymarket.com/order",
+            json=order,
+            headers=headers,
+            timeout=10
+        )
+        return r.json()
     except Exception as e:
         send_msg(f"⚠️ Alım hatası: {str(e)}")
         return None
 
-def sell_token(token_id, size):
+def sell_token(token_id, price, size):
     try:
-        order = client.create_market_order(MarketOrderArgs(
-            token_id=token_id,
-            amount=size,
-            side="SELL"
-        ))
-        resp = client.post_order(order)
-        return resp
+        headers = get_auth_headers()
+        order = {
+            "tokenID": token_id,
+            "price": price,
+            "size": size,
+            "side": "SELL",
+            "orderType": "GTC",
+            "feeRateBps": "0",
+            "nonce": "0",
+            "expiration": "0"
+        }
+        r = requests.post(
+            "https://clob.polymarket.com/order",
+            json=order,
+            headers=headers,
+            timeout=10
+        )
+        return r.json()
     except Exception as e:
         send_msg(f"⚠️ Satış hatası: {str(e)}")
         return None
@@ -114,7 +142,7 @@ def check_markets():
         spent = state["spent"]
 
         if first_half and price < 0.10 and position == 0:
-            resp = buy_token(token_id, 25)
+            resp = buy_token(token_id, price, 25)
             if resp:
                 state["position"] += 25 / price
                 state["spent"] += 25
@@ -122,15 +150,15 @@ def check_markets():
                 send_msg(f"✅ ALIM 1\nFiyat: {price} | $25")
 
         elif first_half and price < 0.05 and position > 0 and spent < 50:
-            resp = buy_token(token_id, 25)
+            resp = buy_token(token_id, price, 25)
             if resp:
                 state["position"] += 25 / price
                 state["spent"] += 25
                 send_msg(f"✅ ALIM 2\nFiyat: {price} | $25")
 
         if position > 0 and price >= 0.50 and not sold_half:
-            sell_size = round(state["position"] * 0.5, 2)
-            resp = sell_token(token_id, sell_size)
+            sell_size = round(state["position"] * 0.5, 4)
+            resp = sell_token(token_id, price, sell_size)
             if resp:
                 state["position"] -= sell_size
                 state["sold_half"] = True
