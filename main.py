@@ -105,7 +105,23 @@ def sell_token(token_id, price, size):
 
 def handle_message(text):
     text = text.strip()
-    if text.startswith("token:"):
+    
+    if "polymarket.com" in text:
+        slug = text.split("/")[-1]
+        try:
+            r = requests.get(f'https://gamma-api.polymarket.com/events?slug={slug}')
+            data = r.json()
+            markets = data[0]['markets']
+            msg = "📋 Bulunan marketler:\n"
+            for i, m in enumerate(markets):
+                cid = m.get('conditionId', '')
+                msg += f"{i+1}. {m['question']}\nID: {cid}\n\n"
+            msg += "Takibe eklemek için:\ntoken:ID_BURAYA"
+            send_msg(msg)
+        except:
+            send_msg("❌ Market bulunamadı.")
+    
+    elif text.startswith("token:"):
         token_id = text.replace("token:", "").strip()
         if token_id not in watched_markets:
             watched_markets[token_id] = {
@@ -117,6 +133,7 @@ def handle_message(text):
             send_msg(f"✅ Eklendi! Takip başlıyor...\n{token_id[:30]}")
         else:
             send_msg("Zaten takipte.")
+    
     elif text == "/liste":
         if watched_markets:
             msg = "📋 Takipteki marketler:\n"
@@ -125,6 +142,7 @@ def handle_message(text):
             send_msg(msg)
         else:
             send_msg("Takipte market yok.")
+    
     elif text == "/temizle":
         watched_markets.clear()
         send_msg("🗑️ Temizlendi.")
