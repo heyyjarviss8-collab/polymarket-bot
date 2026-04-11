@@ -6,23 +6,14 @@ from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# ── ENV ───────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = int(os.environ.get("CHAT_ID"))
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
-CLOB_API_KEY = os.environ.get("CLOB_API_KEY")
-CLOB_SECRET = os.environ.get("CLOB_SECRET")
-CLOB_PASSPHRASE = os.environ.get("CLOB_PASSPHRASE")
 
-CLOB_HOST = "https://clob.polymarket.com"
-
-# ── TAKİP EDİLEN MARKETLER ────────────────────────────────
 watched_markets = {}
 
-# ── FİYAT ÇEK ────────────────────────────────────────────
 def get_price(token_id):
     try:
-        url = f"{CLOB_HOST}/book?token_id={token_id}"
+        url = f"https://clob.polymarket.com/book?token_id={token_id}"
         r = requests.get(url, timeout=10)
         data = r.json()
         asks = data.get("asks", [])
@@ -32,88 +23,9 @@ def get_price(token_id):
     except:
         return None
 
-# ── HEADER OLUŞTUR ────────────────────────────────────────
-def get_headers(method, path, body=""):
-    import hmac
-    import hashlib
-    import base64
-    from datetime import datetime, timezone
+async def send_msg(bot, msg):
+    await bot.send_message(chat_id=CHAT_ID, text=msg)
 
-    timestamp = str(int(datetime.now(timezone.utc).timestamp()))
-    message = timestamp + method.upper() + path + (body or "")
-    
-    secret_bytes = base64.b64decode(CLOB_SECRET)
-    signature = hmac.new(secret_bytes, message.encode(), hashlib.sha256).digest()
-    sig_b64 = base64.b64encode(signature).decode()
-
-    return {
-        "POLY_ADDRESS": CLOB_API_KEY,
-        "POLY_SIGNATURE": sig_b64,
-        "POLY_TIMESTAMP": timestamp,
-        "POLY_PASSPHRASE": CLOB_PASSPHRASE,
-        "Content-Type": "application/json"
-    }
-
-# ── GERÇEK ALIM ───────────────────────────────────────────
-def buy_token(token_id, amount_usd, price):
-    try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType
-
-        client = ClobClient(
-            host=CLOB_HOST,
-            chain_id=137,
-            key=PRIVATE_KEY,
-            creds={
-                "apiKey": CLOB_API_KEY,
-                "secret": CLOB_SECRET,
-                "passphrase": CLOB_PASSPHRASE,
-            }
-        )
-        size = round(amount_usd / price, 4)
-        order = client.create_order(OrderArgs(
-            token_id=token_id,
-            price=price,
-            size=size,
-            side="BUY",
-        ))
-        resp = client.post_order(order, OrderType.FOK)
-        return str(resp)
-    except Exception as e:
-        return f"HATA: {e}"
-
-# ── GERÇEK SATIM ──────────────────────────────────────────
-def sell_token(token_id, size, price):
-    try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType
-
-        client = ClobClient(
-            host=CLOB_HOST,
-            chain_id=137,
-            key=PRIVATE_KEY,
-            creds={
-                "apiKey": CLOB_API_KEY,
-                "secret": CLOB_SECRET,
-                "passphrase": CLOB_PASSPHRASE,
-            }
-        )
-        order = client.create_order(OrderArgs(
-            token_id=token_id,
-            price=price,
-            size=round(size, 4),
-            side="SELL",
-        ))
-        resp = client.post_order(order, OrderType.FOK)
-        return str(resp)
-    except Exception as e:
-        return f"HATA: {e}"
-
-# ── TELEGRAM MESAJ ────────────────────────────────────────
-async def send_msg(app, msg):
-    await app.bot.send_message(chat_id=CHAT_ID, text=msg)
-
-# ── TELEGRAM KOMUTLAR ─────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
@@ -126,10 +38,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "spent": 0,
                 "start_time": datetime.now(timezone.utc)
             }
-            await update.message.reply_text(
-                f"✅ Eklendi!\nToken: {token_id[:30]}\nTakip başlıyor...")
+            await update.message.reply_text(f"✅ Eklendi! Takip başlıyor...")
         else:
-            await update.message.reply_text("Bu market zaten takipte.")
+            await update.message.reply_text("Zaten takipte.")
 
     elif text == "/liste":
         if watched_markets:
@@ -142,14 +53,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "/temizle":
         watched_markets.clear()
-        await update.message.reply_text("🗑️ Tüm marketler temizlendi.")
+        await update.message.reply_text("🗑️ Temizlendi.")
 
-    elif text == "/durum":
-        await update.message.reply_text(
-            f"🤖 Bot aktif\n📊 Takipteki market: {len(watched_markets)}")
-
-# ── STRATEJİ ─────────────────────────────────────────────
-async def check_markets(app):
+async def check_markets(bot):
     for token_id, state in list(watched_markets.items()):
         price = get_price(token_id)
         if price is None:
@@ -161,61 +67,47 @@ async def check_markets(app):
         sold_half = state["sold_half"]
         spent = state["spent"]
 
-        # ALIM 1
         if first_half and price < 0.10 and position == 0:
-            resp = buy_token(token_id, 25, price)
             state["position"] += 25 / price
             state["spent"] += 25
             state["sold_half"] = False
-            await send_msg(app,
-                f"✅ ALIM 1\nFiyat: {price}\nMiktar: $25\n{resp}")
+            await send_msg(bot, f"✅ ALIM 1\nFiyat: {price} | $25")
 
-        # ALIM 2
         elif first_half and price < 0.05 and position > 0 and spent < 50:
-            resp = buy_token(token_id, 25, price)
             state["position"] += 25 / price
             state["spent"] += 25
-            await send_msg(app,
-                f"✅ ALIM 2\nFiyat: {price}\nMiktar: $25\n{resp}")
+            await send_msg(bot, f"✅ ALIM 2\nFiyat: {price} | $25")
 
-        # %50 SAT
         if position > 0 and price >= 0.50 and not sold_half:
-            sell_size = state["position"] * 0.5
-            resp = sell_token(token_id, sell_size, price)
-            state["position"] -= sell_size
+            sell_amount = state["position"] * 0.5
+            state["position"] -= sell_amount
             state["sold_half"] = True
-            kazanc = sell_size * price
-            await send_msg(app,
-                f"💰 %50 SAT\nFiyat: {price}\nKazanç: ${round(kazanc,2)}\n{resp}")
+            kazanc = sell_amount * price
+            await send_msg(bot, f"💰 %50 SAT\nFiyat: {price} | Kazanç: ${round(kazanc,2)}")
 
-# ── SABAH 9 ───────────────────────────────────────────────
-async def morning_ask(app):
-    await send_msg(app,
-        "🌅 Günaydın! Bugün hangi maçları takip edeyim?\n\n"
-        "token:BURAYA_TOKEN_ID şeklinde gönder\n\n"
-        "/liste — takipteki marketler\n"
-        "/temizle — temizle\n"
-        "/durum — bot durumu")
-
-# ── ANA DÖNGÜ ─────────────────────────────────────────────
-async def main_loop(app):
+async def main_loop(bot):
     last_morning = None
     while True:
         now = datetime.now(timezone.utc)
         if now.hour == 6 and now.minute == 0:
             if last_morning != now.date():
-                await morning_ask(app)
+                await send_msg(bot,
+                    "🌅 Günaydın! Bugün hangi maçları takip edeyim?\n"
+                    "token:TOKEN_ID şeklinde gönder.")
                 last_morning = now.date()
-        await check_markets(app)
+        await check_markets(bot)
         await asyncio.sleep(30)
 
-async def post_init(app):
-    asyncio.create_task(main_loop(app))
-
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+async def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
-    app.run_polling()
+    
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        await main_loop(app.bot)
+        await app.updater.stop()
+        await app.stop()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
