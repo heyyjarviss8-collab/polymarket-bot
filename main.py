@@ -15,8 +15,7 @@ POLY_API_KEY = os.environ.get("POLY_API_KEY").strip()
 client = ClobClient(
     host="https://clob.polymarket.com",
     key=PRIVATE_KEY,
-    chain_id=137,
-    api_key=POLY_API_KEY
+    chain_id=137
 )
 
 watched_markets = {}
