@@ -4,7 +4,7 @@ import requests
 from datetime import datetime, timezone
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+CHAT_ID = int(os.environ.get("CHAT_ID"))
 
 watched_markets = {}
 
