@@ -3,11 +3,8 @@ import time
 import asyncio
 import requests
 from datetime import datetime, timezone
-from telegram import Bot, Update
+from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.constants import BUY, SELL
 
 # ── ENV ───────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -17,26 +14,15 @@ CLOB_API_KEY = os.environ.get("CLOB_API_KEY")
 CLOB_SECRET = os.environ.get("CLOB_SECRET")
 CLOB_PASSPHRASE = os.environ.get("CLOB_PASSPHRASE")
 
-# ── POLYMARKET CLIENT ─────────────────────────────────────
-client = ClobClient(
-    host="https://clob.polymarket.com",
-    chain_id=137,
-    key=PRIVATE_KEY,
-    creds={
-        "apiKey": CLOB_API_KEY,
-        "secret": CLOB_SECRET,
-        "passphrase": CLOB_PASSPHRASE,
-    }
-)
+CLOB_HOST = "https://clob.polymarket.com"
 
 # ── TAKİP EDİLEN MARKETLER ────────────────────────────────
-# {token_id: {position, sold_half, spent, start_time}}
 watched_markets = {}
 
 # ── FİYAT ÇEK ────────────────────────────────────────────
 def get_price(token_id):
     try:
-        url = f"https://clob.polymarket.com/book?token_id={token_id}"
+        url = f"{CLOB_HOST}/book?token_id={token_id}"
         r = requests.get(url, timeout=10)
         data = r.json()
         asks = data.get("asks", [])
@@ -46,38 +32,82 @@ def get_price(token_id):
     except:
         return None
 
+# ── HEADER OLUŞTUR ────────────────────────────────────────
+def get_headers(method, path, body=""):
+    import hmac
+    import hashlib
+    import base64
+    from datetime import datetime, timezone
+
+    timestamp = str(int(datetime.now(timezone.utc).timestamp()))
+    message = timestamp + method.upper() + path + (body or "")
+    
+    secret_bytes = base64.b64decode(CLOB_SECRET)
+    signature = hmac.new(secret_bytes, message.encode(), hashlib.sha256).digest()
+    sig_b64 = base64.b64encode(signature).decode()
+
+    return {
+        "POLY_ADDRESS": CLOB_API_KEY,
+        "POLY_SIGNATURE": sig_b64,
+        "POLY_TIMESTAMP": timestamp,
+        "POLY_PASSPHRASE": CLOB_PASSPHRASE,
+        "Content-Type": "application/json"
+    }
+
 # ── GERÇEK ALIM ───────────────────────────────────────────
-def buy_market(token_id, amount_usd, price):
+def buy_token(token_id, amount_usd, price):
     try:
-        size = round(amount_usd / price, 4)
-        order = client.create_market_order(
-            OrderArgs(
-                token_id=token_id,
-                price=price,
-                size=size,
-                side=BUY,
-            )
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OrderArgs, OrderType
+
+        client = ClobClient(
+            host=CLOB_HOST,
+            chain_id=137,
+            key=PRIVATE_KEY,
+            creds={
+                "apiKey": CLOB_API_KEY,
+                "secret": CLOB_SECRET,
+                "passphrase": CLOB_PASSPHRASE,
+            }
         )
+        size = round(amount_usd / price, 4)
+        order = client.create_order(OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side="BUY",
+        ))
         resp = client.post_order(order, OrderType.FOK)
-        return resp
+        return str(resp)
     except Exception as e:
-        return str(e)
+        return f"HATA: {e}"
 
 # ── GERÇEK SATIM ──────────────────────────────────────────
-def sell_market(token_id, size, price):
+def sell_token(token_id, size, price):
     try:
-        order = client.create_market_order(
-            OrderArgs(
-                token_id=token_id,
-                price=price,
-                size=round(size, 4),
-                side=SELL,
-            )
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OrderArgs, OrderType
+
+        client = ClobClient(
+            host=CLOB_HOST,
+            chain_id=137,
+            key=PRIVATE_KEY,
+            creds={
+                "apiKey": CLOB_API_KEY,
+                "secret": CLOB_SECRET,
+                "passphrase": CLOB_PASSPHRASE,
+            }
         )
+        order = client.create_order(OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=round(size, 4),
+            side="SELL",
+        ))
         resp = client.post_order(order, OrderType.FOK)
-        return resp
+        return str(resp)
     except Exception as e:
-        return str(e)
+        return f"HATA: {e}"
 
 # ── TELEGRAM MESAJ ────────────────────────────────────────
 async def send_msg(app, msg):
@@ -97,7 +127,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "start_time": datetime.now(timezone.utc)
             }
             await update.message.reply_text(
-                f"✅ Eklendi!\nToken: {token_id[:30]}...\nTakip başlıyor...")
+                f"✅ Eklendi!\nToken: {token_id[:30]}\nTakip başlıyor...")
         else:
             await update.message.reply_text("Bu market zaten takipte.")
 
@@ -131,42 +161,40 @@ async def check_markets(app):
         sold_half = state["sold_half"]
         spent = state["spent"]
 
-        # ALIM 1 — ilk yarı, fiyat 0.10 altı, pozisyon yok
+        # ALIM 1
         if first_half and price < 0.10 and position == 0:
-            resp = buy_market(token_id, 25, price)
+            resp = buy_token(token_id, 25, price)
             state["position"] += 25 / price
             state["spent"] += 25
             state["sold_half"] = False
             await send_msg(app,
-                f"✅ ALIM 1\nFiyat: {price}\nMiktar: $25\nSonuç: {resp}")
+                f"✅ ALIM 1\nFiyat: {price}\nMiktar: $25\n{resp}")
 
-        # ALIM 2 — ilk yarı, fiyat 0.05 altı, pozisyon var
+        # ALIM 2
         elif first_half and price < 0.05 and position > 0 and spent < 50:
-            resp = buy_market(token_id, 25, price)
+            resp = buy_token(token_id, 25, price)
             state["position"] += 25 / price
             state["spent"] += 25
             await send_msg(app,
-                f"✅ ALIM 2\nFiyat: {price}\nMiktar: $25\nSonuç: {resp}")
+                f"✅ ALIM 2\nFiyat: {price}\nMiktar: $25\n{resp}")
 
-        # %50 SAT — fiyat 0.50'ye ulaştı
+        # %50 SAT
         if position > 0 and price >= 0.50 and not sold_half:
             sell_size = state["position"] * 0.5
-            resp = sell_market(token_id, sell_size, price)
+            resp = sell_token(token_id, sell_size, price)
             state["position"] -= sell_size
             state["sold_half"] = True
             kazanc = sell_size * price
             await send_msg(app,
-                f"💰 %50 SAT\nFiyat: {price}\nTahmini kazanç: ${round(kazanc,2)}\nSonuç: {resp}")
+                f"💰 %50 SAT\nFiyat: {price}\nKazanç: ${round(kazanc,2)}\n{resp}")
 
 # ── SABAH 9 ───────────────────────────────────────────────
 async def morning_ask(app):
     await send_msg(app,
         "🌅 Günaydın! Bugün hangi maçları takip edeyim?\n\n"
-        "Polymarket'ten token ID'yi kopyala ve şu şekilde gönder:\n"
-        "token:BURAYA_TOKEN_ID\n\n"
-        "Komutlar:\n"
+        "token:BURAYA_TOKEN_ID şeklinde gönder\n\n"
         "/liste — takipteki marketler\n"
-        "/temizle — tüm marketleri sil\n"
+        "/temizle — temizle\n"
         "/durum — bot durumu")
 
 # ── ANA DÖNGÜ ─────────────────────────────────────────────
