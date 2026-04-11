@@ -92,7 +92,7 @@ def check_markets():
 
 def main():
     send_msg("🤖 Bot başladı!")
-    offset = None
+    last_update_id = None
     last_morning = None
 
     while True:
@@ -102,12 +102,14 @@ def main():
                 send_msg("🌅 Günaydın! Bugün hangi maçları takip edeyim?\ntoken:TOKEN_ID şeklinde gönder.")
                 last_morning = now.date()
 
-        updates = get_updates(offset)
+        updates = get_updates(last_update_id)
         for update in updates:
-            offset = update["update_id"] + 1
+            last_update_id = update["update_id"] + 1
             if "message" in update and "text" in update["message"]:
                 handle_message(update["message"]["text"])
 
+        check_markets()
+        time.sleep(30)
         check_markets()
         time.sleep(30)
 
