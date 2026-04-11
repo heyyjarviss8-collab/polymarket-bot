@@ -2,20 +2,36 @@ import os
 import time
 import requests
 from datetime import datetime, timezone
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType, Side
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = int(os.environ.get("CHAT_ID"))
+# ENV
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN").strip()
+CHAT_ID = str(os.environ.get("CHAT_ID")).strip()
+PRIVATE_KEY = os.environ.get("PRIVATE_KEY").strip()
+POLY_API_KEY = os.environ.get("POLY_API_KEY").strip()
+
+# Polymarket CLOB client
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    key=PRIVATE_KEY,
+    chain_id=137,
+    api_key=POLY_API_KEY
+)
 
 watched_markets = {}
 
 def send_msg(text):
-    token = TELEGRAM_TOKEN.strip()
-    chat = str(CHAT_ID).strip()
+    token = TELEGRAM_TOKEN
+    chat = CHAT_ID
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.post(url, json={"chat_id": chat, "text": text})
+    try:
+        requests.post(url, json={"chat_id": chat, "text": text}, timeout=10)
+    except:
+        pass
+
 def get_updates(offset=None):
-    token = TELEGRAM_TOKEN.strip()
-    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     params = {"timeout": 10}
     if offset:
         params["offset"] = offset
@@ -35,6 +51,37 @@ def get_price(token_id):
             return float(asks[0]["price"])
         return None
     except:
+        return None
+
+def buy_token(token_id, price, amount_usd):
+    try:
+        size = round(amount_usd / price, 2)
+        order = client.create_order(OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=Side.BUY,
+            order_type=OrderType.GTC
+        ))
+        resp = client.post_order(order)
+        return resp
+    except Exception as e:
+        send_msg(f"⚠️ Alım hatası: {str(e)}")
+        return None
+
+def sell_token(token_id, size, price):
+    try:
+        order = client.create_order(OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=Side.SELL,
+            order_type=OrderType.GTC
+        ))
+        resp = client.post_order(order)
+        return resp
+    except Exception as e:
+        send_msg(f"⚠️ Satış hatası: {str(e)}")
         return None
 
 def handle_message(text):
@@ -75,26 +122,35 @@ def check_markets():
         sold_half = state["sold_half"]
         spent = state["spent"]
 
+        # ALIM 1
         if first_half and price < 0.10 and position == 0:
-            state["position"] += 25 / price
-            state["spent"] += 25
-            state["sold_half"] = False
-            send_msg(f"✅ ALIM 1\nFiyat: {price} | $25")
+            resp = buy_token(token_id, price, 25)
+            if resp:
+                state["position"] += 25 / price
+                state["spent"] += 25
+                state["sold_half"] = False
+                send_msg(f"✅ ALIM 1\nFiyat: {price} | $25\n{resp}")
 
+        # ALIM 2
         elif first_half and price < 0.05 and position > 0 and spent < 50:
-            state["position"] += 25 / price
-            state["spent"] += 25
-            send_msg(f"✅ ALIM 2\nFiyat: {price} | $25")
+            resp = buy_token(token_id, price, 25)
+            if resp:
+                state["position"] += 25 / price
+                state["spent"] += 25
+                send_msg(f"✅ ALIM 2\nFiyat: {price} | $25\n{resp}")
 
+        # %50 SAT
         if position > 0 and price >= 0.50 and not sold_half:
-            sell_amount = state["position"] * 0.5
-            state["position"] -= sell_amount
-            state["sold_half"] = True
-            kazanc = sell_amount * price
-            send_msg(f"💰 %50 SAT\nFiyat: {price} | Kazanç: ${round(kazanc,2)}")
+            sell_size = round(state["position"] * 0.5, 2)
+            resp = sell_token(token_id, sell_size, price)
+            if resp:
+                state["position"] -= sell_size
+                state["sold_half"] = True
+                kazanc = sell_size * price
+                send_msg(f"💰 %50 SAT\nFiyat: {price} | Kazanç: ${round(kazanc,2)}\n{resp}")
 
 def main():
-    send_msg("🤖 Bot başladı!")
+    send_msg("🤖 Bot başladı! Gerçek işlem modu aktif.")
     last_update_id = None
     last_morning = None
 
@@ -113,8 +169,6 @@ def main():
 
         check_markets()
         time.sleep(30)
-        check_markets()
-        time.sleep(30)
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
