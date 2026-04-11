@@ -9,9 +9,10 @@ CHAT_ID = int(os.environ.get("CHAT_ID"))
 watched_markets = {}
 
 def send_msg(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": text})
-
+    token = TELEGRAM_TOKEN.strip()
+    chat = str(CHAT_ID).strip()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.post(url, json={"chat_id": chat, "text": text})
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     params = {"timeout": 10, "offset": offset}
