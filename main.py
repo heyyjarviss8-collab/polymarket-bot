@@ -14,8 +14,11 @@ def send_msg(text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     requests.post(url, json={"chat_id": chat, "text": text})
 def get_updates(offset=None):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"timeout": 10, "offset": offset}
+    token = TELEGRAM_TOKEN.strip()
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    params = {"timeout": 10}
+    if offset:
+        params["offset"] = offset
     try:
         r = requests.get(url, params=params, timeout=15)
         return r.json().get("result", [])
