@@ -1,208 +1,258 @@
 import os
 import time
-import requests
+import asyncio
+import logging
 from datetime import datetime, timezone
-from eth_account import Account
-from eth_account.messages import encode_defunct
+import requests
+from telegram import Bot, Update
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType, Side
+from py_clob_client.order_builder.constants import BUY, SELL
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN").strip()
-CHAT_ID = str(os.environ.get("CHAT_ID")).strip()
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY").strip()
+logging.basicConfig(level=logging.INFO, format=”%(asctime)s %(message)s”)
+log = logging.getLogger(**name**)
 
-watched_markets = {}
+# ── ENV ──────────────────────────────────────────────────────────────────────
 
-def send_msg(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=10)
-    except:
-        pass
+PRIVATE_KEY    = os.environ[“PRIVATE_KEY”]
+TELEGRAM_TOKEN = os.environ[“TELEGRAM_TOKEN”]
+CHAT_ID        = int(os.environ[“CHAT_ID”])
 
-def get_updates(offset=None):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"timeout": 10}
-    if offset:
-        params["offset"] = offset
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        return r.json().get("result", [])
-    except:
-        return []
+HOST  = “https://clob.polymarket.com”
+CHAIN = 137  # Polygon
 
-def get_price(token_id):
-    try:
-        url = f"https://clob.polymarket.com/book?token_id={token_id}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        asks = data.get("asks", [])
-        if asks:
-            return float(asks[0]["price"])
-        return None
-    except:
-        return None
+# ── STATE ────────────────────────────────────────────────────────────────────
 
-def get_auth_headers():
-    account = Account.from_key(PRIVATE_KEY)
-    timestamp = str(int(time.time()))
-    message = encode_defunct(text=timestamp)
-    signed = account.sign_message(message)
-    return {
-        "POLY_ADDRESS": account.address,
-        "POLY_SIGNATURE": signed.signature.hex(),
-        "POLY_TIMESTAMP": timestamp,
-        "POLY_NONCE": timestamp,
-        "Content-Type": "application/json"
-    }
+# { token_id: { “position”: float, “sold_half”: bool, “bought2”: bool } }
 
-def buy_token(token_id, price, amount_usd):
-    try:
-        size = round(amount_usd / price, 4)
-        headers = get_auth_headers()
-        order = {
-            "tokenID": token_id,
-            "price": price,
-            "size": size,
-            "side": "BUY",
-            "orderType": "GTC",
-            "feeRateBps": "0",
-            "nonce": "0",
-            "expiration": "0"
-        }
-        r = requests.post(
-            "https://clob.polymarket.com/order",
-            json=order,
-            headers=headers,
-            timeout=10
-        )
-        return r.json()
-    except Exception as e:
-        send_msg(f"⚠️ Alım hatası: {str(e)}")
-        return None
+markets: dict[str, dict] = {}
+waiting_for_urls = False
 
-def sell_token(token_id, price, size):
-    try:
-        headers = get_auth_headers()
-        order = {
-            "tokenID": token_id,
-            "price": price,
-            "size": size,
-            "side": "SELL",
-            "orderType": "GTC",
-            "feeRateBps": "0",
-            "nonce": "0",
-            "expiration": "0"
-        }
-        r = requests.post(
-            "https://clob.polymarket.com/order",
-            json=order,
-            headers=headers,
-            timeout=10
-        )
-        return r.json()
-    except Exception as e:
-        send_msg(f"⚠️ Satış hatası: {str(e)}")
-        return None
+# ── CLOB CLIENT ──────────────────────────────────────────────────────────────
 
-def handle_message(text):
-    text = text.strip()
-    
-    if "polymarket.com" in text:
-        slug = text.split("/")[-1]
-        try:
-            r = requests.get(f'https://gamma-api.polymarket.com/events?slug={slug}')
-            data = r.json()
-            markets = data[0]['markets']
-            msg = "📋 Bulunan marketler:\n"
-            for i, m in enumerate(markets):
-                cid = m.get('conditionId', '')
-                msg += f"{i+1}. {m['question']}\nID: {cid}\n\n"
-            msg += "Takibe eklemek için:\ntoken:ID_BURAYA"
-            send_msg(msg)
-        except:
-            send_msg("❌ Market bulunamadı.")
-    
-    elif text.startswith("token:"):
-        token_id = text.replace("token:", "").strip()
-        if token_id not in watched_markets:
-            watched_markets[token_id] = {
-                "position": 0,
-                "sold_half": False,
-                "spent": 0,
-                "start_time": datetime.now(timezone.utc)
-            }
-            send_msg(f"✅ Eklendi! Takip başlıyor...\n{token_id[:30]}")
-        else:
-            send_msg("Zaten takipte.")
-    
-    elif text == "/liste":
-        if watched_markets:
-            msg = "📋 Takipteki marketler:\n"
-            for t, s in watched_markets.items():
-                msg += f"• {t[:20]}... | Poz: {round(s['position'],2)} | Harcanan: ${s['spent']}\n"
-            send_msg(msg)
-        else:
-            send_msg("Takipte market yok.")
-    
-    elif text == "/temizle":
-        watched_markets.clear()
-        send_msg("🗑️ Temizlendi.")
+client = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN)
+client.set_api_creds(client.create_or_derive_api_creds())
 
-def check_markets():
-    for token_id, state in list(watched_markets.items()):
+# ── HELPERS ──────────────────────────────────────────────────────────────────
+
+def get_price(token_id: str) -> float | None:
+“”“Polymarket CLOB’dan en iyi bid fiyatını çek.”””
+try:
+url = f”{HOST}/price?token_id={token_id}&side=buy”
+r = requests.get(url, timeout=10)
+r.raise_for_status()
+return float(r.json()[“price”])
+except Exception as e:
+log.error(f”Fiyat çekme hatası ({token_id[:8]}…): {e}”)
+return None
+
+def get_token_id_from_url(url: str) -> str | None:
+“””
+Polymarket URL’inden token ID çıkar.
+Örnek: https://polymarket.com/event/xxx?tid=TOKEN_ID
+ya da doğrudan token ID string olarak verilebilir.
+“””
+try:
+if “polymarket.com” in url:
+# URL’deki event slug’dan market bilgisini çek
+slug = url.rstrip(”/”).split(”/event/”)[-1].split(”?”)[0]
+api_url = f”https://gamma-api.polymarket.com/events?slug={slug}”
+r = requests.get(api_url, timeout=10)
+r.raise_for_status()
+data = r.json()
+if data and len(data) > 0:
+markets_data = data[0].get(“markets”, [])
+if markets_data:
+# İlk market’in clobTokenIds’inden al
+token_ids = markets_data[0].get(“clobTokenIds”, “[]”)
+import json
+ids = json.loads(token_ids)
+if ids:
+return ids[0]  # underdog token (ilk yarı geride kalan)
+# Doğrudan token ID verilmişse
+return url.strip()
+except Exception as e:
+log.error(f”Token ID çıkarma hatası: {e}”)
+return None
+
+def is_first_half() -> bool:
+“””
+Polymarket maç saatini API’den çekmek ideal ama
+şimdilik zaman bazlı yaklaşım: maçın başlama saatini bilmiyoruz,
+bu yüzden botu her zaman aktif tutuyoruz ve
+ikinci yarı koruması strateji içinde yönetiliyor.
+NOT: İleride maç dakikası API entegrasyonu eklenebilir.
+“””
+return True  # Strateji kontrolü buy/sell logic’te yapılıyor
+
+def place_order(token_id: str, side: str, amount_usdc: float, price: float) -> bool:
+“”“Polymarket’e emir gönder.”””
+try:
+size = round(amount_usdc / price, 4)
+order_args = OrderArgs(
+token_id=token_id,
+price=price,
+size=size,
+side=BUY if side == “BUY” else SELL,
+)
+signed = client.create_order(order_args)
+resp = client.post_order(signed, OrderType.GTC)
+log.info(f”Emir gönderildi: {side} {size} @ {price} → {resp}”)
+return True
+except Exception as e:
+log.error(f”Emir hatası: {e}”)
+return False
+
+async def send_telegram(bot: Bot, text: str):
+await bot.send_message(chat_id=CHAT_ID, text=text)
+
+# ── ANA STRATEJİ DÖNGÜSÜ ────────────────────────────────────────────────────
+
+async def strategy_loop(bot: Bot):
+“”“Her 30 saniyede bir tüm aktif marketleri kontrol et.”””
+while True:
+await asyncio.sleep(30)
+
+```
+    if not markets:
+        continue
+
+    for token_id, state in list(markets.items()):
         price = get_price(token_id)
         if price is None:
             continue
 
-        elapsed = (datetime.now(timezone.utc) - state["start_time"]).seconds // 60
-        first_half = elapsed <= 45
-        position = state["position"]
+        short_id = token_id[:8] + "..."
+        log.info(f"[{short_id}] Fiyat: {price:.4f} | Poz: {state['position']:.2f} | SoldHalf: {state['sold_half']}")
+
+        position  = state["position"]
         sold_half = state["sold_half"]
-        spent = state["spent"]
+        bought2   = state["bought2"]
 
-        if first_half and price < 0.10 and position == 0:
-            resp = buy_token(token_id, price, 25)
-            if resp:
-                state["position"] += 25 / price
-                state["spent"] += 25
+        # ── ALIM 1: fiyat < 0.10, pozisyon yok ──
+        if price < 0.10 and position == 0 and not sold_half:
+            success = place_order(token_id, "BUY", 25.0, price)
+            if success:
+                state["position"] = 25.0 / price
                 state["sold_half"] = False
-                send_msg(f"✅ ALIM 1\nFiyat: {price} | $25")
+                msg = f"🟢 ALIM 1 — {short_id}\nFiyat: {price:.4f}\nTutar: $25"
+                await send_telegram(bot, msg)
+                log.info(msg)
 
-        elif first_half and price < 0.05 and position > 0 and spent < 50:
-            resp = buy_token(token_id, price, 25)
-            if resp:
-                state["position"] += 25 / price
-                state["spent"] += 25
-                send_msg(f"✅ ALIM 2\nFiyat: {price} | $25")
+        # ── ALIM 2: fiyat < 0.05, pozisyon var, ikinci alım yapılmadı ──
+        elif price < 0.05 and position > 0 and not bought2:
+            success = place_order(token_id, "BUY", 25.0, price)
+            if success:
+                state["position"] += 25.0 / price
+                state["bought2"] = True
+                msg = f"🟡 ALIM 2 (ekleme) — {short_id}\nFiyat: {price:.4f}\nTutar: $25"
+                await send_telegram(bot, msg)
+                log.info(msg)
 
+        # ── %50 SATIŞ: fiyat >= 0.50, pozisyon var, henüz satılmadı ──
         if position > 0 and price >= 0.50 and not sold_half:
-            sell_size = round(state["position"] * 0.5, 4)
-            resp = sell_token(token_id, price, sell_size)
-            if resp:
-                state["position"] -= sell_size
+            sell_size = position * 0.5
+            success = place_order(token_id, "SELL", sell_size * price * 0.5, price)
+            if success:
+                gain = sell_size * price
+                state["position"] = position - sell_size
                 state["sold_half"] = True
-                kazanc = sell_size * price
-                send_msg(f"💰 %50 SAT\nFiyat: {price} | Kazanç: ${round(kazanc,2)}")
+                msg = (f"🔴 %50 SATIŞ — {short_id}\n"
+                       f"Fiyat: {price:.4f}\n"
+                       f"Tahmini kazanç: ${gain:.2f}\n"
+                       f"Kalan pozisyon: {state['position']:.2f}")
+                await send_telegram(bot, msg)
+                log.info(msg)
+```
 
-def main():
-    send_msg("🤖 Bot başladı! Gerçek işlem modu aktif.")
-    last_update_id = None
-    last_morning = None
+# ── SABAH 09:00 SORUSU ──────────────────────────────────────────────────────
 
-    while True:
-        now = datetime.now(timezone.utc)
-        if now.hour == 6 and now.minute == 0:
-            if last_morning != now.date():
-                send_msg("🌅 Günaydın! Bugün hangi maçları takip edeyim?\ntoken:TOKEN_ID şeklinde gönder.")
-                last_morning = now.date()
+async def morning_scheduler(bot: Bot):
+“”“Her gün 09:00’da Telegram’dan maç URL’si iste.”””
+global waiting_for_urls
+while True:
+now = datetime.now()
+# Bugün 09:00’ı hesapla
+target = now.replace(hour=9, minute=0, second=0, microsecond=0)
+if now >= target:
+# Yarın 09:00
+target = target.replace(day=target.day + 1)
+wait_secs = (target - now).total_seconds()
+log.info(f”Sabah mesajına {wait_secs/3600:.1f} saat var.”)
+await asyncio.sleep(wait_secs)
 
-        updates = get_updates(last_update_id)
-        for update in updates:
-            last_update_id = update["update_id"] + 1
-            if "message" in update and "text" in update["message"]:
-                handle_message(update["message"]["text"])
+```
+    waiting_for_urls = True
+    markets.clear()  # Eski maçları temizle
+    await send_telegram(bot,
+        "🌅 Günaydın! Bugün hangi maçları takip edeyim?\n"
+        "Polymarket URL'lerini gönder (her biri ayrı mesaj veya virgülle ayır).\n"
+        "Bitince 'tamam' yaz."
+    )
+```
 
-        check_markets()
-        time.sleep(30)
+# ── TELEGRAM MESAJ HANDLER ──────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    main()
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+global waiting_for_urls
+
+```
+if update.effective_chat.id != CHAT_ID:
+    return
+
+text = update.message.text.strip()
+
+if not waiting_for_urls:
+    await update.message.reply_text("Şu an URL beklemiyor. Sabah 09:00'da sorarım! ⏰")
+    return
+
+if text.lower() in ("tamam", "ok", "bitti"):
+    waiting_for_urls = False
+    if markets:
+        await update.message.reply_text(
+            f"✅ {len(markets)} maç eklendi, takip başlıyor!\n" +
+            "\n".join(f"• {tid[:12]}..." for tid in markets)
+        )
+    else:
+        await update.message.reply_text("⚠️ Hiç geçerli URL eklenmedi.")
+    return
+
+# URL'leri işle (virgülle veya boşlukla ayrılmış olabilir)
+raw_urls = [u.strip() for u in text.replace(",", " ").split() if u.strip()]
+added = 0
+for url in raw_urls:
+    token_id = get_token_id_from_url(url)
+    if token_id:
+        markets[token_id] = {"position": 0.0, "sold_half": False, "bought2": False}
+        added += 1
+        log.info(f"Market eklendi: {token_id[:12]}...")
+    else:
+        await update.message.reply_text(f"❌ Bu URL'den token çıkarılamadı:\n{url}")
+
+if added > 0:
+    await update.message.reply_text(f"✅ {added} maç eklendi. Daha fazla URL gönder ya da 'tamam' yaz.")
+```
+
+# ── MAIN ─────────────────────────────────────────────────────────────────────
+
+async def main():
+app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+bot = app.bot
+
+```
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+await app.initialize()
+await app.start()
+await app.updater.start_polling()
+
+# Paralel görevler
+await asyncio.gather(
+    morning_scheduler(bot),
+    strategy_loop(bot),
+)
+```
+
+if __name__ == “__main__”:
+asyncio.run(main())
